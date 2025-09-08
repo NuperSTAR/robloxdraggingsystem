@@ -1,261 +1,152 @@
+--!strict
+-- GrabSystemClient.lua
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
-local camera = workspace.CurrentCamera
 local mouse = player:GetMouse()
 
 local GrabSystem = ReplicatedStorage:WaitForChild("GrabSystem")
-local RequestNetworkOwnership = GrabSystem:WaitForChild("RequestNetworkOwnership")
-local ReleaseNetworkOwnership = GrabSystem:WaitForChild("ReleaseNetworkOwnership")
-local BreakConstraints = GrabSystem:WaitForChild("BreakConstraints")
+local RequestGrab = GrabSystem:WaitForChild("RequestGrab") :: RemoteFunction
+local UpdateTarget = GrabSystem:WaitForChild("UpdateTarget") :: RemoteEvent
+local ReleaseGrab = GrabSystem:WaitForChild("ReleaseGrab") :: RemoteEvent
 
-local isGrabbing = false
-local grabbedPart = nil
-local grabAttachment = nil
-local mouseAttachment = nil
-local alignPosition = nil
-local alignOrientation = nil
-local pooledMousePart = nil -- reused between grabs to reduce allocations
-local mouseAttachment = nil
-local currentDistance = 10
-local targetDistance = 10
-local baseDistance = 10
-local originalCameraMaxZoomDistance = nil
-local originalCameraMinZoomDistance = nil
+-- CONFIG
+local BASE_DISTANCE = 10
+local DIST_STEP = 2
+local SLOW_MULT = 0.25 -- Shift
+local FAST_MULT = 2.0   -- Ctrl
+local RAY_LENGTH = 300
+local RAY_PARAMS = RaycastParams.new()
+RAY_PARAMS.FilterType = Enum.RaycastFilterType.Blacklist
+RAY_PARAMS.IgnoreWater = true
 
-local function createMousePart()
-    local part = Instance.new("Part")
-    part.Name = "MouseGrabPart"
-    part.Anchored = true
-    part.CanCollide = false
-    part.Transparency = 1
-    part.Size = Vector3.new(0.1, 0.1, 0.1)
-    part.Parent = workspace
-    return part
+-- State
+local grabbing = false
+local grabbedPart: BasePart? = nil
+local distance = BASE_DISTANCE
+local last = os.clock()
+
+-- Utility
+local function getAimCFrame(): CFrame
+	local cam = Workspace.CurrentCamera
+	if not cam then return CFrame.new() end
+	-- Ray from camera through mouse (or center on touch)
+	local origin = cam.CFrame.Position
+	local dir: Vector3
+	if UserInputService.TouchEnabled and #UserInputService:GetTouches() > 0 then
+		dir = (cam.CFrame.LookVector) * RAY_LENGTH
+	else
+		local unitRay = cam:ScreenPointToRay(mouse.X, mouse.Y)
+		dir = unitRay.Direction * RAY_LENGTH
+	end
+
+	local result = Workspace:Raycast(origin, dir, RAY_PARAMS)
+	local targetPos = result and result.Position or (origin + dir)
+	return CFrame.lookAt(targetPos, targetPos + cam.CFrame.LookVector)
 end
 
-local function createAttachments(part)
-    local partAttachment = Instance.new("Attachment")
-    partAttachment.Parent = part
-
-    if not pooledMousePart or not pooledMousePart.Parent then
-        pooledMousePart = pooledMousePart or createMousePart()
-        pooledMousePart.Parent = workspace
-    end
-
-    local mouseAttachmentLocal = Instance.new("Attachment")
-    mouseAttachmentLocal.Parent = pooledMousePart
-
-    return partAttachment, mouseAttachmentLocal, pooledMousePart
+local function scaleByModifiers(step: number): number
+	local mult = 1
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
+		mult *= SLOW_MULT
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
+		mult *= FAST_MULT
+	end
+	return step * mult
 end
 
-local function createConstraints(partAttachment, mouseAttachment, part)
-    local mass = part:GetMass()
-    local baseResponsiveness = 50
-    local baseMaxForce = 10000
+local function startGrab(targetPart: BasePart?)
+	if grabbing then return end
+	if not targetPart then return end
 
-    local massMultiplier = math.clamp(mass / 10, 0.5, 3)
-    local responsiveness = math.clamp(baseResponsiveness / massMultiplier, 5, 200)
-    local maxForce = math.clamp(baseMaxForce * massMultiplier, 1000, 50000)
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
 
-    local alignPos = Instance.new("AlignPosition")
-    alignPos.Attachment0 = partAttachment
-    alignPos.Attachment1 = mouseAttachment
-    alignPos.Responsiveness = responsiveness
-    alignPos.MaxForce = maxForce
-    alignPos.Parent = partAttachment.Parent
+	-- Estimate initial distance
+	local origin = cam.CFrame.Position
+	local d = (targetPart.Position - origin).Magnitude
+	distance = math.clamp(d, 2, 60)
 
-    return alignPos
+	local ok = false
+	local success, res = pcall(function()
+		return RequestGrab:InvokeServer(targetPart, targetPart.Position, distance)
+	end)
+	if success and res == true then
+		grabbing = true
+		grabbedPart = targetPart
+	else
+		grabbing = false
+		grabbedPart = nil
+	end
+	last = os.clock()
 end
 
-local function createOrientationConstraint(partAttachment, mouseAttachment, part)
-    local alignOri = Instance.new("AlignOrientation")
-    alignOri.Attachment0 = partAttachment
-    alignOri.Attachment1 = mouseAttachment
-    alignOri.Responsiveness = 50
-    alignOri.MaxTorque = 5000
-    alignOri.Parent = partAttachment.Parent
-    return alignOri
+local function stopGrab()
+	if not grabbing then return end
+	grabbing = false
+	grabbedPart = nil
+	ReleaseGrab:FireServer()
 end
 
-local grabbedAncestryConn = nil
+-- Input
+local function onInputBegan(input: InputObject, gpe: boolean)
+	if gpe then return end
 
-local function cleanupGrab()
-    if alignPosition then
-        alignPosition:Destroy()
-        alignPosition = nil
-    end
-    if alignOrientation then
-        alignOrientation:Destroy()
-        alignOrientation = nil
-    end
-    if grabAttachment then
-        grabAttachment:Destroy()
-        grabAttachment = nil
-    end
-    if mouseAttachment then
-        mouseAttachment:Destroy()
-        mouseAttachment = nil
-    end
-    -- keep pooledMousePart alive for reuse
-    if mouseAttachment then
-        mouseAttachment:Destroy()
-        mouseAttachment = nil
-    end
-    if grabbedPart then
-        ReleaseNetworkOwnership:FireServer(grabbedPart)
-        if grabbedAncestryConn then
-            grabbedAncestryConn:Disconnect()
-            grabbedAncestryConn = nil
-        end
-        grabbedPart = nil
-    end
-    
-    if originalCameraMaxZoomDistance then
-        player.CameraMaxZoomDistance = originalCameraMaxZoomDistance
-        originalCameraMaxZoomDistance = nil
-    end
-    if originalCameraMinZoomDistance then
-        player.CameraMinZoomDistance = originalCameraMinZoomDistance
-        originalCameraMinZoomDistance = nil
-    end
-    
-    isGrabbing = false
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local target = mouse.Target
+		if target and target:IsA("BasePart") then
+			startGrab(target)
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		local touchTarget = mouse.Target -- Roblox syncs this reasonably for taps
+		if touchTarget and touchTarget:IsA("BasePart") then
+			startGrab(touchTarget)
+		end
+	elseif input.KeyCode == Enum.KeyCode.E then
+		if mouse.Target and mouse.Target:IsA("BasePart") then
+			startGrab(mouse.Target)
+		end
+	end
 end
 
-local function updateMousePosition(dt)
-    if not isGrabbing or not pooledMousePart then return end
-
-    local mouseRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
-    -- smooth distance
-    currentDistance = currentDistance + (targetDistance - currentDistance) * math.clamp(dt * 12, 0, 1)
-    local targetPosition = mouseRay.Origin + mouseRay.Direction * currentDistance
-    pooledMousePart.CFrame = CFrame.new(targetPosition)
+local function onInputEnded(input: InputObject, gpe: boolean)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+		or input.KeyCode == Enum.KeyCode.E then
+		stopGrab()
+	end
 end
 
-local function raycastForPart()
-    local mouseRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
-    local raycastParams = RaycastParams.new()
-    raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
-    raycastParams.FilterDescendantsInstances = {camera, player.Character}
-    
-    local raycastResult = workspace:Raycast(mouseRay.Origin, mouseRay.Direction * 1000, raycastParams)
-    
-    if raycastResult then
-        local hitPart = raycastResult.Instance
-        if hitPart and not hitPart.Anchored then
-            local grabValue = hitPart:FindFirstChild("grab")
-            if grabValue and grabValue:IsA("BoolValue") and grabValue.Value then
-                return hitPart
-            end
-        end
-    end
-    return nil
+local function onWheel(input: InputObject, gpe: boolean)
+	if not grabbing then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+	distance += scaleByModifiers((input.Position.Z > 0) and DIST_STEP or -DIST_STEP)
 end
 
-local lastOwnershipRequest = 0
-local ownershipRequestInterval = 0.5 -- seconds
+UserInputService.InputBegan:Connect(onInputBegan)
+UserInputService.InputEnded:Connect(onInputEnded)
+UserInputService.InputChanged:Connect(onWheel)
 
-local function startGrab()
-    local targetPart = raycastForPart()
-    if not targetPart then return end
-    
-    grabbedPart = targetPart
-    isGrabbing = true
-    currentDistance = baseDistance
-    targetDistance = baseDistance
-    
-    originalCameraMaxZoomDistance = player.CameraMaxZoomDistance
-    originalCameraMinZoomDistance = player.CameraMinZoomDistance
-    player.CameraMaxZoomDistance = 0
-    player.CameraMinZoomDistance = 0
-    
-    -- request ownership once at start
-    RequestNetworkOwnership:FireServer(grabbedPart)
-    lastOwnershipRequest = tick()
-    
-    grabAttachment, mouseAttachment, pooledMousePart = createAttachments(grabbedPart)
-    alignPosition = createConstraints(grabAttachment, mouseAttachment, grabbedPart)
+-- Per-frame target update (client → server)
+RunService.RenderStepped:Connect(function()
+	if not grabbing then return end
+	local now = os.clock()
+	local dt = math.max(1/240, math.min(1/30, now - last))
+	last = now
 
-    -- optional orientation control if part requests it
-    local lockRotation = grabbedPart:FindFirstChild("lockRotation")
-    if lockRotation and lockRotation:IsA("BoolValue") and lockRotation.Value then
-        alignOrientation = createOrientationConstraint(grabAttachment, mouseAttachment, grabbedPart)
-    end
-    
-    local mass = grabbedPart:GetMass()
-    print("Grabbed object with mass:", mass, "- Responsiveness:", alignPosition.Responsiveness, "- MaxForce:", alignPosition.MaxForce)
-    
-    updateMousePosition(0.016)
-    
-    local breakableValue = grabbedPart:FindFirstChild("breakable")
-    if breakableValue and breakableValue:IsA("BoolValue") and breakableValue.Value then
-        BreakConstraints:FireServer(grabbedPart)
-    end
+	local aim = getAimCFrame()
+	-- push a point distance in front of the camera along aim
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local origin = cam.CFrame.Position
+	local targetPos = origin + (aim.LookVector * distance)
+	local world = CFrame.lookAt(targetPos, targetPos + aim.LookVector)
 
-    -- cleanup if the part is removed from the world
-    if grabbedPart then
-        grabbedAncestryConn = grabbedPart.AncestryChanged:Connect(function()
-            if not grabbedPart:IsDescendantOf(workspace) then
-                cleanupGrab()
-            end
-        end)
-    end
-end
-
-local function maintainNetworkOwnership()
-    if isGrabbing and grabbedPart then
-        local now = tick()
-        if now - lastOwnershipRequest >= ownershipRequestInterval then
-            RequestNetworkOwnership:FireServer(grabbedPart)
-            lastOwnershipRequest = now
-        end
-    end
-end
-
-local function endGrab()
-    if isGrabbing then
-        cleanupGrab()
-    end
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if not isGrabbing then
-            startGrab()
-        end
-    end
+	UpdateTarget:FireServer(world, distance, dt)
 end)
-
-UserInputService.InputEnded:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if isGrabbing then
-            endGrab()
-        end
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    
-    if input.UserInputType == Enum.UserInputType.MouseWheel and isGrabbing then
-        targetDistance = math.max(2, math.min(50, targetDistance + input.Position.Z * 2))
-        -- immediate visual update handled in RenderStepped smoothing
-    end
-end)
-
-
-
-RunService.RenderStepped:Connect(function(dt)
-    if isGrabbing then
-        updateMousePosition(dt)
-        maintainNetworkOwnership()
-    end
-end) 
