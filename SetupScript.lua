@@ -17,7 +17,30 @@ local function createGrabSystem()
     breakConstraints.Name = "BreakConstraints"
     breakConstraints.Parent = grabSystem
     
+    local throwObject = Instance.new("RemoteEvent")
+    throwObject.Name = "ThrowObject"
+    throwObject.Parent = grabSystem
+    
     print("GrabSystem setup complete!")
 end
 
-createGrabSystem() 
+local function createRagdollSystem()
+    local activateRagdoll = Instance.new("RemoteEvent")
+    activateRagdoll.Name = "ActivateRagdoll"
+    activateRagdoll.Parent = ReplicatedStorage
+    
+    activateRagdoll.OnServerEvent:Connect(function(player)
+        local character = player.Character
+        if character then
+            local activateBoolValue = character:FindFirstChild("IsRagdoll")
+            if activateBoolValue then
+                activateBoolValue.Value = not activateBoolValue.Value
+            end
+        end
+    end)
+    
+    print("Ragdoll system setup complete!")
+end
+
+createGrabSystem()
+createRagdollSystem() 
