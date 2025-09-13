@@ -140,11 +140,11 @@ end
 
 local function updateMousePosition()
 	if not isGrabbing or not mousePart then return end
-	
+
 	-- Get mouse position in world space
 	local mouseRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
 	local targetPosition = mouseRay.Origin + mouseRay.Direction * currentDistance
-	
+
 	-- Smooth the position to prevent jittering
 	if mousePart.CFrame then
 		local currentPos = mousePart.CFrame.Position
@@ -182,7 +182,7 @@ local function startGrab()
 
 	grabbedPart = target
 	isGrabbing = true
-	
+
 	-- Calculate the actual distance from camera to the part when grabbed
 	local cameraToPart = (grabbedPart.Position - camera.CFrame.Position).Magnitude
 	currentDistance = cameraToPart
@@ -217,10 +217,10 @@ end
 
 local function startThrowCharge()
 	if not isGrabbing or not grabbedPart then return end
-	
+
 	isChargingThrow = true
 	throwChargeStartTime = time()
-	
+
 	-- Store original mouse part position
 	if mousePart then
 		originalMousePartPosition = mousePart.CFrame.Position
@@ -229,20 +229,20 @@ end
 
 local function updateThrowCharge()
 	if not isChargingThrow or not isGrabbing or not grabbedPart or not mousePart then return end
-	
+
 	throwChargeDuration = time() - throwChargeStartTime
 	local maxChargeTime = 2.0 -- Maximum 2 seconds charge
-	
+
 	-- Move object closer to humanoid while charging (not camera)
 	if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
 		local humanoidPosition = player.Character.HumanoidRootPart.Position
 		local currentPos = mousePart.CFrame.Position
 		local directionToHumanoid = (humanoidPosition - currentPos).Unit
-		
+
 		-- Move closer by a small amount based on charge time
 		local pullDistance = math.min(throwChargeDuration * 2, 3) -- Max 3 studs closer
 		local newPosition = currentPos + directionToHumanoid * pullDistance
-		
+
 		mousePart.CFrame = CFrame.new(newPosition)
 	end
 end
@@ -255,33 +255,33 @@ end
 
 local function executeThrow()
 	if not isChargingThrow or not isGrabbing or not grabbedPart then return end
-	
+
 	-- Calculate throw strength based on charge time and object mass
 	local mass = grabbedPart:GetMass()
 	local maxChargeTime = 2.0
 	local chargeRatio = math.min(throwChargeDuration / maxChargeTime, 1.0)
-	
+
 	-- Base throw strength (will be multiplied by mass on server for realistic scaling)
 	local baseThrowStrength = 50
 	local massMultiplier = math.clamp(1 / (mass / 10), 0.3, 2) -- Heavier objects get less strength
 	local throwStrength = baseThrowStrength * chargeRatio * massMultiplier
-	
+
 	-- Get throw direction (from humanoid to object)
 	local throwDirection = Vector3.new(0, 0, 0)
 	if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
 		local humanoidPosition = player.Character.HumanoidRootPart.Position
 		local objectPosition = grabbedPart.Position
 		throwDirection = (objectPosition - humanoidPosition).Unit
-		
+
 		-- Add some upward arc for realistic trajectory
 		throwDirection = throwDirection + Vector3.new(0, 0.3, 0)
 		throwDirection = throwDirection.Unit
 	end
-	
+
 	-- Send throw request to server with direction and strength separately
 	-- Server will handle wobble, momentum carry-through, and mass scaling
 	ThrowObject:FireServer(grabbedPart, throwDirection, throwStrength)
-	
+
 	-- End the grab
 	endGrab()
 end
